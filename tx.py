@@ -6,6 +6,32 @@ from zoneinfo import ZoneInfo
 
 TORONTO_TZ = ZoneInfo("America/Toronto")
 
+USAGE_TEXT = (
+    "Usage:\n"
+    "  tx.py read-all DB_PATH\n"
+    "  tx.py recent DB_PATH [limit] [--pretty]\n"
+    "  tx.py insert DB_PATH merchant amount location_dtz\n"
+    "  tx.py delete DB_PATH id\n"
+    "  tx.py prev-month-total DB_PATH anchor_datetime_with_offset\n"
+)
+
+SQL_SELECT_ALL = "SELECT * FROM transactions ORDER BY ts_utc DESC"
+SQL_SELECT_RECENT = "SELECT * FROM transactions ORDER BY ts_utc DESC LIMIT ?"
+SQL_INSERT_TX = """
+        INSERT INTO transactions (merchant, amount, toronto_dt, ts_utc, location_dtz, note)
+        VALUES (?, ?, ?, ?, ?, NULL)
+        """
+SQL_DELETE_BY_ID = "DELETE FROM transactions WHERE id = ?"
+SQL_PREV_MONTH_START = """
+        SELECT (strftime('%Y-%m', date(? || '-01', '-1 month')) || '-01T00:00:00')
+        """
+SQL_PREV_MONTH_TOTAL = """
+        SELECT COALESCE(SUM(amount), 0)
+        FROM transactions
+        WHERE toronto_dt >= ?
+          AND toronto_dt <  ?
+        """
+
 
 def connect(db_path: str) -> sqlite3.Connection:
     return sqlite3.connect(db_path)
@@ -26,6 +52,31 @@ def iso_to_toronto_dt_and_ts_utc(location_dtz: str) -> tuple[str, int]:
     return toronto_dt, ts_utc
 
 
+def _unpack_row(row):
+    (
+        id_,
+        merchant,
+        amount,
+        toronto_dt,
+        ts_utc,
+        location_dtz,
+        note,
+        created_at_utc,
+        updated_at_utc,
+    ) = row
+    return (
+        id_,
+        merchant,
+        amount,
+        toronto_dt,
+        ts_utc,
+        location_dtz,
+        note,
+        created_at_utc,
+        updated_at_utc,
+    )
+
+
 def row_to_csv_line(row) -> str:
     # Full row format (CSV-like, no escaping)
     (
@@ -38,7 +89,7 @@ def row_to_csv_line(row) -> str:
         note,
         created_at_utc,
         updated_at_utc,
-    ) = row
+    ) = _unpack_row(row)
     note_s = "" if note is None else str(note)
     updated_s = "" if updated_at_utc is None else str(updated_at_utc)
 
@@ -67,7 +118,7 @@ def row_to_pretty_csv_line(row) -> str:
         note,
         created_at_utc,
         updated_at_utc,
-    ) = row
+    ) = _unpack_row(row)
     toronto_pretty = toronto_dt.replace("T", " ")
     return f"{id_},{float(amount):.2f},{merchant},{toronto_pretty}"
 
@@ -118,7 +169,7 @@ def validate_insert_inputs(
 def read_all(db_path: str) -> None:
     con = connect(db_path)
     cur = con.cursor()
-    cur.execute("SELECT * FROM transactions ORDER BY ts_utc DESC")
+    cur.execute(SQL_SELECT_ALL)
     for row in cur.fetchall():
         print(row_to_csv_line(row))
     con.close()
@@ -130,7 +181,7 @@ def read_recent(db_path: str, limit: int, pretty: bool = False) -> None:
 
     con = connect(db_path)
     cur = con.cursor()
-    cur.execute("SELECT * FROM transactions ORDER BY ts_utc DESC LIMIT ?", (limit,))
+    cur.execute(SQL_SELECT_RECENT, (limit,))
     rows = cur.fetchall()
     con.close()
 
@@ -147,22 +198,17 @@ def insert_tx(db_path: str, merchant: str, amount: str, location_dtz: str) -> No
 
     con = connect(db_path)
     cur = con.cursor()
-    cur.execute(
-        """
-        INSERT INTO transactions (merchant, amount, toronto_dt, ts_utc, location_dtz, note)
-        VALUES (?, ?, ?, ?, ?, NULL)
-        """,
-        (merchant, amount_f, toronto_dt, ts_utc, location_dtz),
-    )
+    cur.execute(SQL_INSERT_TX, (merchant, amount_f, toronto_dt, ts_utc, location_dtz))
     con.commit()
     new_id = cur.lastrowid
     con.close()
     print(f"OK id={new_id}")
 
+
 def delete_by_id(db_path: str, tx_id: int) -> None:
     con = connect(db_path)
     cur = con.cursor()
-    cur.execute("DELETE FROM transactions WHERE id = ?", (tx_id,))
+    cur.execute(SQL_DELETE_BY_ID, (tx_id,))
     con.commit()
     deleted = cur.rowcount
     con.close()
@@ -188,24 +234,11 @@ def calculate_previous_month_total(db_path: str, anchor_dt_with_offset: str) -> 
     cur = con.cursor()
 
     # Previous month start boundary (computed via SQLite month math)
-    cur.execute(
-        """
-        SELECT (strftime('%Y-%m', date(? || '-01', '-1 month')) || '-01T00:00:00')
-        """,
-        (curr_month,),
-    )
+    cur.execute(SQL_PREV_MONTH_START, (curr_month,))
     prev_start = cur.fetchone()[0]
 
     # Total for previous month
-    cur.execute(
-        """
-        SELECT COALESCE(SUM(amount), 0)
-        FROM transactions
-        WHERE toronto_dt >= ?
-          AND toronto_dt <  ?
-        """,
-        (prev_start, curr_start),
-    )
+    cur.execute(SQL_PREV_MONTH_TOTAL, (prev_start, curr_start))
     total = cur.fetchone()[0]
     con.close()
 
@@ -214,14 +247,7 @@ def calculate_previous_month_total(db_path: str, anchor_dt_with_offset: str) -> 
 
 def main(argv: list[str]) -> None:
     if len(argv) < 3:
-        die(
-            "Usage:\n"
-            "  tx.py read-all DB_PATH\n"
-            "  tx.py recent DB_PATH [limit] [--pretty]\n"
-            "  tx.py insert DB_PATH merchant amount location_dtz\n"
-            "  tx.py delete DB_PATH id\n"
-            "  tx.py prev-month-total DB_PATH anchor_datetime_with_offset\n"
-        )
+        die(USAGE_TEXT)
 
     cmd = argv[1]
     db_path = argv[2]
